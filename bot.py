@@ -24,7 +24,7 @@ except ImportError:
 # Does not place trades; scans public Gamma data only.
 # =========================================================
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 # MSK = UTC+3 year-round (no DST); avoids ZoneInfo/tzdata on minimal Windows installs
 MSK_TZ = timezone(timedelta(hours=3), name="MSK")
 
@@ -73,6 +73,8 @@ MODE = (os.getenv("MODE") or "bot").strip().lower()
 
 # Gamma GET /events — same host as docs: https://gamma-api.polymarket.com
 GAMMA_EVENTS_URL = (os.getenv("GAMMA_EVENTS_URL") or "https://gamma-api.polymarket.com/events").strip()
+# live API expects e.g. volume24hr; volume_24hr returns 422 "order fields are not valid"
+GAMMA_EVENTS_ORDER = (os.getenv("GAMMA_EVENTS_ORDER") or "volume24hr").strip()
 MAX_EVENTS_PER_REQUEST = _env_int("MAX_EVENTS_PER_REQUEST", 100)
 ONLY_ACTIVE = _env_bool("ONLY_ACTIVE", True)
 ONLY_OPEN = _env_bool("ONLY_OPEN", True)
@@ -209,13 +211,13 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def fetch_active_events(session: Optional[requests.Session] = None) -> List[Dict[str, Any]]:
     """
     Gamma API: GET /events with active, closed, order, ascending, limit.
-    See https://docs.polymarket.com/developers/gamma-markets-api/get-events
+    Docs mention volume_24hr; actual API validates order field — use volume24hr (see GAMMA_EVENTS_ORDER).
     """
     http = session or requests
     params = {
         "active": str(ONLY_ACTIVE).lower(),
         "closed": str(not ONLY_OPEN).lower(),
-        "order": "volume_24hr",
+        "order": GAMMA_EVENTS_ORDER,
         "ascending": "false",
         "limit": MAX_EVENTS_PER_REQUEST,
     }
