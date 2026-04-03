@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from unittest.mock import patch
+from urllib.parse import quote
 
 import requests
 
@@ -24,7 +25,7 @@ except ImportError:
 # Does not place trades; scans public Gamma data only.
 # =========================================================
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 # MSK = UTC+3 year-round (no DST); avoids ZoneInfo/tzdata on minimal Windows installs
 MSK_TZ = timezone(timedelta(hours=3), name="MSK")
 
@@ -56,6 +57,39 @@ def _env_float(key: str, default: float) -> float:
         return float(str(val).strip())
     except ValueError:
         return default
+
+
+def _proxy_dict_for_prefix(prefix: str) -> Optional[Dict[str, str]]:
+    """
+    optional HTTP(S) or SOCKS proxy for requests.
+    either PREFIX_PROXY_URL (one line) or PREFIX_PROXY_HOST + PORT + USER + PASSWORD.
+    passwords with special chars: use split vars or percent-encode in URL.
+    socks5:// needs PySocks (see requirements).
+    """
+    url = (os.getenv(f"{prefix}_PROXY_URL") or "").strip()
+    if url:
+        return {"http": url, "https": url}
+    host = (os.getenv(f"{prefix}_PROXY_HOST") or "").strip()
+    if not host:
+        return None
+    port = _env_int(f"{prefix}_PROXY_PORT", 0)
+    if port <= 0:
+        return None
+    user = (os.getenv(f"{prefix}_PROXY_USER") or "").strip()
+    password = os.getenv(f"{prefix}_PROXY_PASSWORD") or ""
+    if user:
+        auth = f"{quote(user, safe='')}:{quote(password, safe='')}@"
+    else:
+        auth = ""
+    full = f"http://{auth}{host}:{port}"
+    return {"http": full, "https": full}
+
+
+def build_requests_session(proxy_dict: Optional[Dict[str, str]] = None) -> requests.Session:
+    s = requests.Session()
+    if proxy_dict:
+        s.proxies.update(proxy_dict)
+    return s
 
 
 def telegram_token() -> str:
@@ -457,7 +491,8 @@ def send_test_message() -> None:
     log = get_logger()
     message = "🚀 Polymarket Signal Bot V2 connected and running"
     log.info("sending Telegram test message")
-    success = send_telegram_message(message)
+    tg_session = build_requests_session(_proxy_dict_for_prefix("TELEGRAM"))
+    success = send_telegram_message(message, session=tg_session)
     log.info("test message sent." if success else "test message failed.")
 
 
@@ -491,10 +526,20 @@ def run_bot(poll_interval_seconds: int = POLL_INTERVAL_SECONDS) -> None:
     loop_count = 0
     log = get_logger()
 
+    tg_proxy = _proxy_dict_for_prefix("TELEGRAM")
+    gamma_proxy = _proxy_dict_for_prefix("GAMMA")
+    if tg_proxy:
+        log.info("telegram requests use proxy (url not logged)")
+    if gamma_proxy:
+        log.info("gamma requests use proxy (url not logged)")
+
+    telegram_session = build_requests_session(tg_proxy)
+    gamma_session = build_requests_session(gamma_proxy)
+
     while True:
         loop_count += 1
         log.info("scan cycle %s | fetching Gamma events", loop_count)
-        signals = scan_once()
+        signals = scan_once(session=gamma_session)
 
         if not signals:
             log.info("no qualifying signals this cycle")
@@ -503,7 +548,7 @@ def run_bot(poll_interval_seconds: int = POLL_INTERVAL_SECONDS) -> None:
             key = build_signal_key(signal)
             if key in seen:
                 continue
-            was_sent = send_signal(signal)
+            was_sent = send_signal(signal, session=telegram_session)
             if was_sent:
                 seen.add(key)
 
@@ -626,6 +671,38 @@ def test_passes_event_filters_false_for_sports() -> None:
     assert passes_event_filters(event) is False
 
 
+def test_proxy_dict_url_takes_precedence() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "TELEGRAM_PROXY_URL": "http://user:secret@198.51.100.1:8080",
+            "TELEGRAM_PROXY_HOST": "ignored",
+            "TELEGRAM_PROXY_PORT": "1",
+        },
+        clear=False,
+    ):
+        p = _proxy_dict_for_prefix("TELEGRAM")
+        assert p == {"http": "http://user:secret@198.51.100.1:8080", "https": "http://user:secret@198.51.100.1:8080"}
+
+
+def test_proxy_dict_from_host_port_user_password() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "TELEGRAM_PROXY_URL": "",
+            "TELEGRAM_PROXY_HOST": "198.51.100.2",
+            "TELEGRAM_PROXY_PORT": "8888",
+            "TELEGRAM_PROXY_USER": "u",
+            "TELEGRAM_PROXY_PASSWORD": "p@x",
+        },
+        clear=False,
+    ):
+        p = _proxy_dict_for_prefix("TELEGRAM")
+        assert p is not None
+        assert "198.51.100.2:8888" in p["https"]
+        assert "u:" in p["https"]
+
+
 def test_format_signal() -> None:
     signal = {
         "event_title": "Sample event",
@@ -659,6 +736,8 @@ def run_tests() -> None:
     test_analyze_market_bad_prices()
     test_passes_event_filters_true()
     test_passes_event_filters_false_for_sports()
+    test_proxy_dict_url_takes_precedence()
+    test_proxy_dict_from_host_port_user_password()
     test_format_signal()
     get_logger().info("all tests passed | version=%s", VERSION)
 
