@@ -30,7 +30,7 @@ except ImportError:
 # Modes: MODE=run_tests | test_message | bot | report
 # =========================================================
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 MSK_TZ = timezone(timedelta(hours=3), name="MSK")
 
 
@@ -159,21 +159,25 @@ REUTERS_GOOGLE_NEWS_QUERIES = [
     "site:reuters.com Trump election",
     "site:reuters.com Biden election",
 ]
-DIRECT_RSS_FEEDS = [
+# feeds.reuters.com часто не резолвится / www.reuters.com/rss — 401 без подписки; Reuters через Google RSS + TheNewsAPI
+_DIRECT_RSS_FEEDS_DEFAULT = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://feeds.reuters.com/reuters/technologyNews",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC finance
-    "https://www.cnbc.com/id/10000664/device/rss/rss.html",   # CNBC economy
-    "https://theblock.co/rss.xml",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.cnbc.com/id/10000664/device/rss/rss.html",
 ]
+# браузероподобный запрос: иначе CNBC и др. режут «python-requests» (403)
+_RSS_UA_DEFAULT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+RSS_HTTP_HEADERS = {
+    "User-Agent": (os.getenv("RSS_USER_AGENT") or _RSS_UA_DEFAULT).strip(),
+    "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+}
 _NEWSAPI_EVERYTHING_QUERIES_DEFAULT = [
-    "(SEC OR regulator) AND (ETF OR bitcoin OR ethereum)",
-    "(Federal Reserve OR Fed) AND (rates OR cut OR hike)",
-    "US CPI inflation",
-    "US recession",
-    "(Trump OR Biden) AND election",
-    "(Solana OR token) AND (ETF OR launch)",
+    "(SEC OR Fed OR CPI) AND (ETF OR bitcoin OR rates OR inflation OR recession)",
+    "(Trump OR Biden OR election) AND (policy OR tariff OR election)",
+    "(Solana OR ethereum OR crypto) AND (ETF OR launch OR regulation)",
 ]
 # короткий список запросов к GDELT (меньше 429); расширить можно через GDELT_QUERIES_ENV
 GDELT_QUERIES = [
@@ -392,6 +396,10 @@ def thenewsapi_queries_resolved() -> List[str]:
 
 def gdelt_queries_resolved() -> List[str]:
     return _env_multiline_list("GDELT_QUERIES_ENV", GDELT_QUERIES)
+
+
+def direct_rss_feeds_resolved() -> List[str]:
+    return _env_multiline_list("DIRECT_RSS_FEEDS", _DIRECT_RSS_FEEDS_DEFAULT)
 
 
 def newsapi_domains_for_request() -> str:
@@ -783,7 +791,7 @@ def dedupe_and_rank_news(items: List[NewsItem]) -> List[NewsItem]:
 def fetch_rss_feed(url: str, provider: str, session: Optional[requests.Session] = None) -> List[NewsItem]:
     http = session or requests
     try:
-        response = http.get(url, timeout=REQUEST_TIMEOUT)
+        response = http.get(url, timeout=REQUEST_TIMEOUT, headers=RSS_HTTP_HEADERS)
         response.raise_for_status()
         root = ET.fromstring(response.content)
     except Exception as error:
@@ -821,7 +829,7 @@ def fetch_direct_rss(session: Optional[requests.Session] = None) -> List[NewsIte
     if not ENABLE_DIRECT_RSS:
         return []
     items: List[NewsItem] = []
-    for url in DIRECT_RSS_FEEDS:
+    for url in direct_rss_feeds_resolved():
         items.extend(fetch_rss_feed(url, "direct_rss", session=session))
     return items
 
@@ -872,6 +880,7 @@ def fetch_newsapi_articles(session: Optional[requests.Session] = None) -> List[N
             get_logger().warning("NewsAPI not ok | q=%s | %s", query[:80], msg)
             continue
         articles = data.get("articles", [])
+        get_logger().info("NewsAPI ok | q=%s | articles=%s", query[:80], len(articles))
         for article in articles:
             if not isinstance(article, dict):
                 continue
