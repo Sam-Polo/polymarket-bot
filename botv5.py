@@ -14,6 +14,11 @@ from urllib.parse import quote, quote_plus
 from xml.etree import ElementTree as ET
 
 import requests
+try:
+    from curl_cffi import requests as curl_requests
+    _CURL_CFFI_AVAILABLE = True
+except ImportError:
+    _CURL_CFFI_AVAILABLE = False
 
 try:
     from dotenv import load_dotenv
@@ -123,6 +128,10 @@ MARKET_COOLDOWN_MIN = _env_int("MARKET_COOLDOWN_MIN", 20)
 CLUSTER_COOLDOWN_MIN = _env_int("CLUSTER_COOLDOWN_MIN", 15)
 
 ENABLE_GOOGLE_RSS = _env_bool("ENABLE_GOOGLE_RSS", True)
+# Google News RSS: run every N cycles + pause between requests to avoid connection resets
+# 20 queries/cycle × every 5 cycles × 60s = ~5760 req/day — acceptable
+GOOGLE_RSS_EVERY_N_CYCLES = _env_int("GOOGLE_RSS_EVERY_N_CYCLES", 5)
+GOOGLE_RSS_INTER_REQUEST_DELAY = _env_float("GOOGLE_RSS_INTER_REQUEST_DELAY", 2.0)
 ENABLE_DIRECT_RSS = _env_bool("ENABLE_DIRECT_RSS", True)
 # бесплатный NewsAPI плох для низкой задержки — по умолчанию выкл.; живой поток: RSS + TheNewsAPI + GDELT
 ENABLE_NEWSAPI = _env_bool("ENABLE_NEWSAPI", False)
@@ -172,7 +181,11 @@ _RSS_UA_DEFAULT = (
 )
 RSS_HTTP_HEADERS = {
     "User-Agent": (os.getenv("RSS_USER_AGENT") or _RSS_UA_DEFAULT).strip(),
-    "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 _NEWSAPI_EVERYTHING_QUERIES_DEFAULT = [
     "(SEC OR Fed OR CPI) AND (ETF OR bitcoin OR rates OR inflation OR recession)",
@@ -816,12 +829,42 @@ def fetch_rss_feed(url: str, provider: str, session: Optional[requests.Session] 
     return items
 
 
+_google_rss_call_count = 0
+
+
 def fetch_google_news_rss(session: Optional[requests.Session] = None) -> List[NewsItem]:
+    global _google_rss_call_count
     if not ENABLE_GOOGLE_RSS:
         return []
+    _google_rss_call_count += 1
+    if GOOGLE_RSS_EVERY_N_CYCLES > 1 and (_google_rss_call_count % GOOGLE_RSS_EVERY_N_CYCLES) != 1:
+        get_logger().debug("Google RSS skipped this cycle (%s/%s)", _google_rss_call_count, GOOGLE_RSS_EVERY_N_CYCLES)
+        return []
     items: List[NewsItem] = []
-    for query in GOOGLE_NEWS_QUERIES + REUTERS_GOOGLE_NEWS_QUERIES:
-        items.extend(fetch_rss_feed(build_google_news_rss_url(query), "google_news_rss", session=session))
+    for idx, query in enumerate(GOOGLE_NEWS_QUERIES + REUTERS_GOOGLE_NEWS_QUERIES):
+        if idx > 0 and GOOGLE_RSS_INTER_REQUEST_DELAY > 0:
+            time.sleep(GOOGLE_RSS_INTER_REQUEST_DELAY)
+        url = build_google_news_rss_url(query)
+        if _CURL_CFFI_AVAILABLE:
+            try:
+                resp = curl_requests.get(url, impersonate="chrome110", timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                root = ET.fromstring(resp.content)
+                for rss_item in root.findall(".//item"):
+                    title = (rss_item.findtext("title") or "").strip()
+                    if title:
+                        items.append(make_news_item(
+                            title=title,
+                            link=(rss_item.findtext("link") or "").strip(),
+                            description=(rss_item.findtext("description") or "").strip(),
+                            published_at=parse_pub_date(rss_item.findtext("pubDate")),
+                            source=(rss_item.findtext("source") or "").strip(),
+                            provider="google_news_rss",
+                        ))
+                continue
+            except Exception as err:
+                get_logger().warning("Google RSS curl failed | url=%s | err=%s", url, err)
+        items.extend(fetch_rss_feed(url, "google_news_rss", session=session))
     return items
 
 
